@@ -56,6 +56,7 @@ export interface InstallOpts {
   runDir: string;
   contextName?: string;
   daemonConfig?: string;
+  rootless?: boolean;
 }
 
 interface LimaImage {
@@ -65,12 +66,13 @@ interface LimaImage {
 }
 
 export class Install {
-  private readonly runDir: string;
+  private runDir: string;
   private readonly source: InstallSource;
   private readonly contextName: string;
   private readonly daemonConfig?: string;
   private _version: string | undefined;
   private _toolDir: string | undefined;
+  private rootless: boolean;
 
   private gitCommit: string | undefined;
 
@@ -78,6 +80,7 @@ export class Install {
 
   constructor(opts: InstallOpts) {
     this.runDir = opts.runDir;
+    this.rootless = opts.rootless || false;
     this.source = opts.source || {
       type: 'archive',
       version: 'latest',
@@ -195,7 +198,13 @@ export class Install {
     if (!this.runDir) {
       throw new Error('runDir must be set');
     }
-    switch (os.platform()) {
+
+    const platform = os.platform();
+    if (this.rootless && platform != 'linux') {
+      // TODO: Support on macOS (via lima)
+      throw new Error(`rootless is only supported on linux`);
+    }
+    switch (platform) {
       case 'darwin': {
         return await this.installDarwin();
       }
@@ -339,21 +348,34 @@ export class Install {
     }
 
     const envs = Object.assign({}, process.env, {
-      PATH: `${this.toolDir}:${process.env.PATH}`
+      PATH: `${this.toolDir}:${process.env.PATH}`,
+      XDG_RUNTIME_DIR: (this.rootless && this.runDir) || undefined
     }) as {
       [key: string]: string;
     };
 
     await core.group('Start Docker daemon', async () => {
       const bashPath: string = await io.which('bash', true);
-      const cmd = `${this.toolDir}/dockerd --host="${dockerHost}" --config-file="${daemonConfigPath}" --exec-root="${this.runDir}/execroot" --data-root="${this.runDir}/data" --pidfile="${this.runDir}/docker.pid" --userland-proxy=false`;
+      let dockerPath = `${this.toolDir}/dockerd`;
+      if (this.rootless) {
+        dockerPath = `${this.toolDir}/dockerd-rootless.sh`;
+        if (fs.existsSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns')) {
+          await Exec.exec('sudo', ['sh', '-c', 'echo 0 > /proc/sys/kernel/apparmor_restrict_unprivileged_userns']);
+        }
+      }
+
+      const cmd = `${dockerPath} --host="${dockerHost}" --config-file="${daemonConfigPath}" --exec-root="${this.runDir}/execroot" --data-root="${this.runDir}/data" --pidfile="${this.runDir}/docker.pid"`;
       core.info(`[command] ${cmd}`); // https://github.com/actions/toolkit/blob/3d652d3133965f63309e4b2e1c8852cdbdcb3833/packages/exec/src/toolrunner.ts#L47
+      let sudo = 'sudo';
+      if (this.rootless) {
+        sudo += ' -u \\#1001';
+      }
       const proc = await child_process.spawn(
         // We can't use Exec.exec here because we need to detach the process to
         // avoid killing it when the action finishes running. Even if detached,
         // we also need to run dockerd in a subshell and unref the process so
         // GitHub Action doesn't wait for it to finish.
-        `sudo env "PATH=$PATH" ${bashPath} << EOF
+        `${sudo} env "PATH=$PATH" ${bashPath} << EOF
 ( ${cmd} 2>&1 | tee "${this.runDir}/dockerd.log" ) &
 EOF`,
         [],
